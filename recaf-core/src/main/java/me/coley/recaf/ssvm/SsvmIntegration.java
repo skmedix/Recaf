@@ -1,13 +1,12 @@
 package me.coley.recaf.ssvm;
 
 import dev.xdark.ssvm.VirtualMachine;
-import dev.xdark.ssvm.classloading.BootClassLoader;
-import dev.xdark.ssvm.classloading.CompositeBootClassLoader;
 import dev.xdark.ssvm.execution.ExecutionContext;
 import dev.xdark.ssvm.execution.VMException;
 import dev.xdark.ssvm.fs.FileDescriptorManager;
 import dev.xdark.ssvm.fs.Handle;
 import dev.xdark.ssvm.fs.HostFileDescriptorManager;
+import dev.xdark.ssvm.fs.ZipFile;
 import dev.xdark.ssvm.mirror.InstanceJavaClass;
 import dev.xdark.ssvm.mirror.JavaClass;
 import dev.xdark.ssvm.util.VMHelper;
@@ -16,8 +15,6 @@ import dev.xdark.ssvm.value.InstanceValue;
 import dev.xdark.ssvm.value.Value;
 import me.coley.recaf.code.CommonClassInfo;
 import me.coley.recaf.code.MethodInfo;
-import me.coley.recaf.ssvm.loader.RuntimeBootClassLoader;
-import me.coley.recaf.ssvm.loader.WorkspaceBootClassLoader;
 import me.coley.recaf.util.AccessFlag;
 import me.coley.recaf.util.logging.Logging;
 import me.coley.recaf.util.threading.ThreadPoolFactory;
@@ -27,8 +24,8 @@ import org.slf4j.Logger;
 
 import java.io.*;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.List;
+import java.util.Random;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.function.Consumer;
@@ -40,26 +37,30 @@ import java.util.function.Consumer;
  */
 public class SsvmIntegration {
 	private static final Value[] EMPTY_STACK = new Value[0];
+	private static final String RECAF_LIVE_ZIP = "recaf-workspace.jar";
+	private static final long RECAF_LIVE_ZIP_HANDLE = new Random().nextLong();
 	private static final Logger logger = Logging.get(SsvmIntegration.class);
 	private static final ExecutorService vmThreadPool = ThreadPoolFactory.newFixedThreadPool("Recaf SSVM");
-	private final Workspace workspace;
+	private final WorkspaceZipFile workspaceZip;
 	private VirtualMachine vm;
 	private boolean initialized;
 	private Exception initializeError;
 	private boolean allowRead;
 	private boolean allowWrite;
 
+
 	/**
 	 * @param workspace
 	 * 		Workspace to pull classes from.
 	 */
 	public SsvmIntegration(Workspace workspace) {
-		this.workspace = workspace;
+		this.workspaceZip = new WorkspaceZipFile(workspace);
 		vmThreadPool.submit(() -> {
 			try {
 				vm = createVM(false, null);
 				try {
 					vm.bootstrap();
+					applyBootstrapFixes(vm);
 					initialized = true;
 				} catch (Exception ex) {
 					initializeError = ex;
@@ -106,6 +107,22 @@ public class SsvmIntegration {
 			protected FileDescriptorManager createFileDescriptorManager() {
 				return new HostFileDescriptorManager() {
 					@Override
+					public synchronized long openZipFile(String path, int mode) throws IOException {
+						if (RECAF_LIVE_ZIP.equals(path)) {
+							return RECAF_LIVE_ZIP_HANDLE;
+						}
+						return super.openZipFile(path, mode);
+					}
+
+					@Override
+					public synchronized ZipFile getZipFile(long handle) {
+						if (RECAF_LIVE_ZIP_HANDLE == handle) {
+							return workspaceZip;
+						}
+						return super.getZipFile(handle);
+					}
+
+					@Override
 					public long open(String path, int mode) throws IOException {
 						long fd = newFD();
 						if ((allowRead && mode == READ) || (allowWrite && (mode == WRITE || mode == APPEND)))
@@ -137,24 +154,28 @@ public class SsvmIntegration {
 					}
 				};
 			}
-
-			@Override
-			protected BootClassLoader createBootClassLoader() {
-				return new CompositeBootClassLoader(Arrays.asList(
-						new WorkspaceBootClassLoader(workspace),
-						new RuntimeBootClassLoader()
-				));
-			}
 		};
 		if (initialize)
 			try {
 				vm.bootstrap();
+				applyBootstrapFixes(vm);
+				VirtualMachineUtil.addUrl(vm, RECAF_LIVE_ZIP);
 				if (postInit != null)
 					postInit.accept(vm);
 			} catch (Exception ex) {
 				logger.error("Failed to initialize VM", ex);
 			}
 		return vm;
+	}
+
+	/**
+	 * Runs a few actions to force the VM to load properly when using {@link #runMethod(VirtualMachine, CommonClassInfo, MethodInfo, Value[])}.
+	 *
+	 * @param vm
+	 * 		VM to modify.
+	 */
+	private static void applyBootstrapFixes(VirtualMachine vm) {
+		vm.findBootstrapClass("jdk/internal/ref/CleanerFactory", true);
 	}
 
 	/**
@@ -244,10 +265,18 @@ public class SsvmIntegration {
 	 * @return Result of invoke.
 	 */
 	public CompletableFuture<VmRunResult> runMethod(VirtualMachine vm, CommonClassInfo owner, MethodInfo method, Value[] parameters) {
-		InstanceJavaClass vmClass = (InstanceJavaClass) vm.findBootstrapClass(owner.getName());
-		if (vmClass == null) {
+		InstanceJavaClass vmClass;
+		try {
+			vmClass = (InstanceJavaClass) vm.findClass(VirtualMachineUtil.getSystemClassLoader(vm), owner.getName(), true);
+			if (vmClass == null) {
+				return CompletableFuture.completedFuture(
+						new VmRunResult(new IllegalStateException("Class not found in VM: " + owner.getName())));
+			}
+		} catch (Exception ex) {
+			// If the class isn't found we get 'null'.
+			// If the class is found but cannot be loaded we probably get some error that we need to handle here.
 			return CompletableFuture.completedFuture(
-					new VmRunResult(new IllegalStateException("Class not found in VM: " + owner.getName())));
+					new VmRunResult(new IllegalStateException("Failed to initialize class: " + owner.getName(), unwrap(ex))));
 		}
 		// Invoke with parameters and return value
 		return CompletableFuture.supplyAsync(() -> {
